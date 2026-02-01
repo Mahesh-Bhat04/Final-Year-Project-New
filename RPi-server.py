@@ -26,8 +26,22 @@ from did_vc import (
 
 app = Flask(__name__)
 
-# Validator URL for device registration (override with env VALIDATOR_URL)
-VALIDATOR_URL = os.environ.get('VALIDATOR_URL', 'http://127.0.0.1:5000')
+# Validator URL: config file overrides env; both can be overridden by UI or API
+VALIDATOR_URL_FILE = "validator_url.txt"
+DEFAULT_VALIDATOR_URL = "http://127.0.0.1:5000"
+
+def get_validator_url():
+    """Current Validator URL: config file if present and non-empty, else env, else default."""
+    p = Path(VALIDATOR_URL_FILE)
+    if p.is_file():
+        try:
+            s = p.read_text().strip()
+            if s:
+                return s
+        except Exception:
+            pass
+    return os.environ.get('VALIDATOR_URL', DEFAULT_VALIDATOR_URL)
+
 DEVICE_SK_PATH = "device_sk.txt"
 DEVICE_PK_PATH = "device_pk.txt"
 VC_PATH = "vc.json"
@@ -111,8 +125,8 @@ def register_with_validator(validator_url=None, attributes=None):
     Generates/loads DID, POSTs to Validator, stores VC and validator_pk.
     Returns (success: bool, message: str).
     """
-    if validator_url is None:
-        validator_url = VALIDATOR_URL
+    if validator_url is None or (isinstance(validator_url, str) and not validator_url.strip()):
+        validator_url = get_validator_url()
     if attributes is None:
         attributes = []
     try:
@@ -172,7 +186,7 @@ def device_register():
     Body (optional): { "validator_url": "...", "attributes": [...] }
     """
     values = request.get_json(silent=True) or {}
-    url = values.get('validator_url') or VALIDATOR_URL
+    url = values.get('validator_url') or get_validator_url()
     attrs = values.get('attributes', [])
     ok, msg = register_with_validator(validator_url=url, attributes=attrs)
     if ok:
@@ -347,8 +361,9 @@ def _column(col):
 node_identifier = str(uuid4()).replace('-', '')
 
 def _do_register_ui():
-    """Phase 1: Register with Validator and update UI."""
-    ok, msg = register_with_validator()
+    """Phase 1: Register with Validator and update UI. Uses URL from Validator URL field or config."""
+    url = text_validator_url.get().strip() if text_validator_url.get() else None
+    ok, msg = register_with_validator(validator_url=url)
     if ok:
         text_keygen_time.set("Registered: " + msg[:40] + "...")
         try:
@@ -358,12 +373,37 @@ def _do_register_ui():
     else:
         text_keygen_time.set("Registration failed: " + msg[:50])
 
+def _do_set_validator_url():
+    """Save Validator URL from the entry field so it overrides env and is used for registration."""
+    url = text_validator_url.get().strip()
+    if not url:
+        text_keygen_time.set("Enter a URL first, then click Set URL")
+        return
+    try:
+        Path(VALIDATOR_URL_FILE).write_text(url)
+        text_keygen_time.set("Validator URL set. You can Register now.")
+    except Exception as e:
+        text_keygen_time.set("Failed to save URL: " + str(e)[:40])
+
 main_window = Tk()
 main_window.title("Blockchain Based Message Dissemination - Smart Device Window")
-main_window.geometry("600x280")
+main_window.geometry("600x320")
 text_keygen_time = StringVar()
 label_keygen_time = Label(main_window, text="Integrity Checking:").place(x=_column(1), y=_line(1))
 entry_keygen_time = Entry(main_window, textvariable=text_keygen_time).place(x=_column(3)-35, y=_line(1))
+
+# Phase 1: Validator URL (override; survives restart)
+text_validator_url = StringVar()
+if Path(VALIDATOR_URL_FILE).is_file():
+    try:
+        text_validator_url.set(Path(VALIDATOR_URL_FILE).read_text().strip())
+    except Exception:
+        text_validator_url.set(get_validator_url())
+else:
+    text_validator_url.set(get_validator_url())
+Label(main_window, text="Validator URL (Phase 1):").place(x=_column(1), y=_line(2))
+Entry(main_window, textvariable=text_validator_url, width=45).place(x=_column(1), y=_line(2)+2, width=380)
+Button(main_window, text="Set URL", command=_do_set_validator_url).place(x=_column(1)+390, y=_line(2))
 
 # Phase 1: DID / VC registration
 text_did_status = StringVar()
@@ -373,9 +413,9 @@ try:
     text_did_status.set("DID: " + did_i[:24] + "... | " + ("VC stored" if vc_exists else "Not registered"))
 except Exception:
     text_did_status.set("DID: (generate on Register)")
-Label(main_window, text="Identity (Phase 1):").place(x=_column(1), y=_line(2))
-Entry(main_window, textvariable=text_did_status, width=50).place(x=_column(1), y=_line(2)+2, width=400)
-Button(main_window, text="Register with Validator", command=_do_register_ui).place(x=_column(1), y=_line(3))
+Label(main_window, text="Identity (Phase 1):").place(x=_column(1), y=_line(3))
+Entry(main_window, textvariable=text_did_status, width=50).place(x=_column(1), y=_line(3)+2, width=400)
+Button(main_window, text="Register with Validator", command=_do_register_ui).place(x=_column(1), y=_line(4))
 
 listening_thread = threading.Thread(name="listening", target=start_listening, daemon=True)
 listening_thread.start()
