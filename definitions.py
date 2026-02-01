@@ -31,41 +31,50 @@ class Blockchain:
         self.blockchain_filename = 'blockchain.pkl'
         self.rpis_filename = 'rpis.pkl'
 
+    # Transaction type: 'message' (legacy) or 'device_registration' (Phase 1 anchor)
+    def _is_device_registration(self, transaction):
+        return transaction.get('type') == 'device_registration'
+
     def get_file_names(self):
         aux = []
         for block in self.chain:
             for transaction in block['transactions']:
-                aux.append(transaction['name'])
+                if self._is_device_registration(transaction):
+                    continue
+                aux.append(transaction.get('name', ''))
         return aux
 
     def print_chain(self):
         printchain = []
         auxchain = copy.deepcopy(self.chain)
         for block in auxchain:
-            auxblock = {}
             auxtime = strftime('%x %X', time.localtime(block["timestamp"]))
-            auxblock['block_index'] = block['index']
-            auxblock['previous_hash'] = block['previous_hash']
-            auxblock['block_hash'] = block['hash'] # Defination Later Section?
             for transaction in block["transactions"]:
-                auxblock['file_hash'] = transaction['file_hash']
-                auxblock['ct'] = transaction['ct']
-                auxblock['pi'] = transaction['pi']
-                auxblock['pk'] = transaction['pk']
-                auxblock['time_stamp'] = auxtime
-                auxblock['name'] = transaction['name']
-            printchain.append(auxblock)
+                auxblock = {'block_index': block['index'], 'previous_hash': block['previous_hash'],
+                            'block_hash': block['hash'], 'time_stamp': auxtime}
+                if self._is_device_registration(transaction):
+                    auxblock['type'] = 'device_registration'
+                    auxblock['did_i'] = transaction['did_i']
+                    auxblock['vc_hash'] = transaction['vc_hash']
+                else:
+                    auxblock['type'] = 'message'
+                    auxblock['file_hash'] = transaction.get('file_hash')
+                    auxblock['ct'] = transaction.get('ct')
+                    auxblock['pi'] = transaction.get('pi')
+                    auxblock['pk'] = transaction.get('pk')
+                    auxblock['name'] = transaction.get('name')
+                printchain.append(auxblock)
         # print("Print Chain", printchain)
 
     def print_transactions(self):
         if len(self.current_transactions) == 0:
             print("INFO - Currently there are no transactions")
         for transaction in self.current_transactions:
-            aux_trans = {}
-            aux_trans['name'] = transaction['name']
-            aux_trans['file_hash'] = transaction['file_hash']
-            aux_trans['pk'] = transaction['pk'] # Enough, no need anything else
-            print(aux_trans)
+            if self._is_device_registration(transaction):
+                print({'type': 'device_registration', 'did_i': transaction['did_i'], 'vc_hash': transaction['vc_hash']})
+            else:
+                aux_trans = {'type': 'message', 'name': transaction.get('name'), 'file_hash': transaction.get('file_hash'), 'pk': transaction.get('pk')}
+                print(aux_trans)
 
     def send_updates(self, rpi_address, name, file, file_hash, ct, pi, pk):
         update = {
@@ -98,6 +107,8 @@ class Blockchain:
 
         last_block = self.chain[len(self.chain)-1]
         for transaction in last_block['transactions']:
+            if self._is_device_registration(transaction):
+                continue  # Device registration anchors are not pushed as message updates
 
             _name = transaction['name']
             _file = transaction['file']
@@ -283,6 +294,9 @@ class Blockchain:
                 return False
 
     def valid_file(self, transaction):
+        if self._is_device_registration(transaction):
+            return True  # No file to validate for device registration anchors
+
         _file = transaction['file']  # from where it's dictionary?
         _filename = transaction['name']
 
@@ -336,6 +350,7 @@ class Blockchain:
 
     def new_transaction(self, name, file, file_hash, ct, pi, pk):
         transaction = {
+            'type': 'message',
             'name': name,
             'file': file,
             'file_hash': file_hash,
@@ -350,6 +365,20 @@ class Blockchain:
 
         return self.last_block['index'] + 1
 
+    def new_transaction_device_registration(self, did_i, vc_hash, timestamp=None):
+        """Phase 1: Anchor device registration on chain. Blockchain adds {did_i, vc_hash, timestamp}."""
+        if timestamp is None:
+            timestamp = time.time()
+        transaction = {
+            'type': 'device_registration',
+            'did_i': did_i,
+            'vc_hash': vc_hash,
+            'timestamp': timestamp
+        }
+        self.current_transactions.append(transaction)
+        self.populate_transaction(transaction)
+        return self.last_block['index'] + 1
+
     @property
     def last_block(self):
         print("Chain Len: " + str(len(self.chain)))
@@ -359,24 +388,27 @@ class Blockchain:
     @staticmethod
     def hash(block):
         """
-        Creates a SHA-256 hash of a CT or Block
-        :param block: Block
-        For block, we must make sure that the Dictionary is Ordered, or we'll have inconsistent hashes
+        Creates a SHA-256 hash of a Block.
+        For blocks with device_registration anchors use full block JSON; else legacy (first tx ct).
         """
         trns_list = block['transactions']
 
         if len(trns_list) > 0:
-
-            print("Block ==> " + str(block))
-            ct_hash = trns_list[0]['ct']
-            # print("ct ==> " + str(ct_hash))
-            block_string = json.dumps(ct_hash, sort_keys=True).encode()
+            first = trns_list[0]
+            if first.get('type') == 'device_registration':
+                # Phase 1: canonical hash of full block for anchor blocks
+                block_string = json.dumps(block, sort_keys=True).encode()
+                return hashlib.sha256(block_string).hexdigest()
+            # Legacy: first transaction's ct (message type)
+            if 'ct' in first:
+                print("Block ==> " + str(block))
+                block_string = json.dumps(first['ct'], sort_keys=True).encode()
+                return hashlib.sha256(block_string).hexdigest()
+            block_string = json.dumps(block, sort_keys=True).encode()
             return hashlib.sha256(block_string).hexdigest()
-
         else:
             print("Block ==> " + str(block))
             block_string = json.dumps(block, sort_keys=True).encode()
-            #print("block_string ==> " + str(block_string))
             return hashlib.sha256(block_string).hexdigest()
 
     @staticmethod

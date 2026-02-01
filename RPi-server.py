@@ -1,6 +1,7 @@
 from tkinter import *
 from CPABSC_Hybrid_R import *
 import os
+import requests
 from flask import Flask, jsonify, request
 from uuid import uuid4
 import threading
@@ -11,7 +12,26 @@ import urllib.parse
 from pathlib import Path
 from charm.core.engine.util import objectToBytes, bytesToObject
 
+# Phase 1: DID and VC (device registration)
+from did_vc import (
+    generate_device_keypair,
+    did_from_public_key,
+    save_keypair_to_files,
+    load_keypair_from_files,
+    vc_verify,
+    vc_hash,
+    vc_serialize,
+    vc_deserialize,
+)
+
 app = Flask(__name__)
+
+# Validator URL for device registration (override with env VALIDATOR_URL)
+VALIDATOR_URL = os.environ.get('VALIDATOR_URL', 'http://127.0.0.1:5000')
+DEVICE_SK_PATH = "device_sk.txt"
+DEVICE_PK_PATH = "device_pk.txt"
+VC_PATH = "vc.json"
+VALIDATOR_PK_PATH = "validator_pk.txt"
 
 groupObj = PairingGroup('SS512')
 cpabe = CPabe_BSW07(groupObj)
@@ -70,6 +90,61 @@ def initialize_keys():
         k_sign = None
         msk = None
 
+def ensure_device_did():
+    """Ensure device has a keypair and DID; generate if missing."""
+    sk_path = Path(DEVICE_SK_PATH)
+    pk_path = Path(DEVICE_PK_PATH)
+    if sk_path.is_file() and pk_path.is_file():
+        try:
+            sk_b, pk_b = load_keypair_from_files(DEVICE_SK_PATH, DEVICE_PK_PATH)
+            return did_from_public_key(pk_b), sk_b, pk_b
+        except Exception:
+            pass
+    sk_b, pk_b = generate_device_keypair()
+    save_keypair_to_files(sk_b, pk_b, DEVICE_SK_PATH, DEVICE_PK_PATH)
+    return did_from_public_key(pk_b), sk_b, pk_b
+
+
+def register_with_validator(validator_url=None, attributes=None):
+    """
+    Phase 1: Register this device with the Validator.
+    Generates/loads DID, POSTs to Validator, stores VC and validator_pk.
+    Returns (success: bool, message: str).
+    """
+    if validator_url is None:
+        validator_url = VALIDATOR_URL
+    if attributes is None:
+        attributes = []
+    try:
+        did_i, _sk, _pk = ensure_device_did()
+        r = requests.post(
+            validator_url.rstrip('/') + '/validator/register',
+            json={'did_i': did_i, 'attributes': attributes},
+            headers={'Content-Type': 'application/json'},
+            timeout=10
+        )
+        if r.status_code != 201:
+            return False, r.text or str(r.status_code)
+        data = r.json()
+        vc_signed = data.get('vc_i')
+        vc_hash_val = data.get('vc_hash')
+        if not vc_signed or not vc_hash_val:
+            return False, 'Validator did not return vc_i or vc_hash'
+        with open(VC_PATH, 'w') as f:
+            f.write(vc_serialize(vc_signed))
+        pk_r = requests.get(validator_url.rstrip('/') + '/validator/public_key', timeout=5)
+        if pk_r.status_code == 200:
+            validator_pk_b64 = pk_r.json().get('validator_pk')
+            if validator_pk_b64:
+                with open(VALIDATOR_PK_PATH, 'w') as f:
+                    f.write(validator_pk_b64)
+        return True, f'Registered DID: {did_i}, vc_hash: {vc_hash_val[:16]}...'
+    except requests.exceptions.ConnectionError:
+        return False, f'Could not connect to Validator at {validator_url}'
+    except Exception as e:
+        return False, str(e)
+
+
 def start_listening():
     initialize_keys()
     app.app_context()
@@ -81,6 +156,29 @@ def transactions():
         'message': "PONG!",
     }
     return jsonify(response), 200
+
+@app.route('/device/identity', methods=['GET'])
+def device_identity():
+    """Phase 1: Return device DID and registration status."""
+    did_i, _, _ = ensure_device_did()
+    registered = Path(VC_PATH).is_file()
+    return jsonify({'did_i': did_i, 'registered': registered}), 200
+
+
+@app.route('/device/register', methods=['POST'])
+def device_register():
+    """
+    Phase 1: Trigger registration with Validator.
+    Body (optional): { "validator_url": "...", "attributes": [...] }
+    """
+    values = request.get_json(silent=True) or {}
+    url = values.get('validator_url') or VALIDATOR_URL
+    attrs = values.get('attributes', [])
+    ok, msg = register_with_validator(validator_url=url, attributes=attrs)
+    if ok:
+        return jsonify({'message': msg, 'did_i': ensure_device_did()[0]}), 201
+    return jsonify({'error': msg}), 400
+
 
 @app.route('/keys/receive', methods=['POST'])
 def receive_keys():
@@ -248,12 +346,36 @@ def _column(col):
 
 node_identifier = str(uuid4()).replace('-', '')
 
+def _do_register_ui():
+    """Phase 1: Register with Validator and update UI."""
+    ok, msg = register_with_validator()
+    if ok:
+        text_keygen_time.set("Registered: " + msg[:40] + "...")
+        try:
+            text_did_status.set("DID: " + ensure_device_did()[0][:24] + "... | VC stored")
+        except Exception:
+            pass
+    else:
+        text_keygen_time.set("Registration failed: " + msg[:50])
+
 main_window = Tk()
 main_window.title("Blockchain Based Message Dissemination - Smart Device Window")
-main_window.geometry("600x250")
+main_window.geometry("600x280")
 text_keygen_time = StringVar()
 label_keygen_time = Label(main_window, text="Integrity Checking:").place(x=_column(1), y=_line(1))
 entry_keygen_time = Entry(main_window, textvariable=text_keygen_time).place(x=_column(3)-35, y=_line(1))
+
+# Phase 1: DID / VC registration
+text_did_status = StringVar()
+try:
+    did_i, _, _ = ensure_device_did()
+    vc_exists = Path(VC_PATH).is_file()
+    text_did_status.set("DID: " + did_i[:24] + "... | " + ("VC stored" if vc_exists else "Not registered"))
+except Exception:
+    text_did_status.set("DID: (generate on Register)")
+Label(main_window, text="Identity (Phase 1):").place(x=_column(1), y=_line(2))
+Entry(main_window, textvariable=text_did_status, width=50).place(x=_column(1), y=_line(2)+2, width=400)
+Button(main_window, text="Register with Validator", command=_do_register_ui).place(x=_column(1), y=_line(3))
 
 listening_thread = threading.Thread(name="listening", target=start_listening, daemon=True)
 listening_thread.start()

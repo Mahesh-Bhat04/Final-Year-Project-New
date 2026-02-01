@@ -8,6 +8,15 @@ import tkinter.filedialog as filedialog
 from pathlib import Path
 from CPABSC_Hybrid_R import *
 from definitions import *
+from did_vc import (
+    generate_validator_keypair,
+    load_validator_keys,
+    save_validator_keys,
+    vc_create,
+    vc_sign,
+    vc_hash,
+    vc_serialize,
+)
 from random import SystemRandom
 from uuid import uuid4
 import requests
@@ -113,6 +122,24 @@ else:
     k_sign_read.close()
 # Keys Generation End ========== x ==========
 
+# Phase 1: Validator keypair for VC issuance (DID Registry / Validator)
+validator_sk_path = Path("validator_sk.txt")
+validator_pk_path = Path("validator_pk.txt")
+if validator_pk_path.is_file() and validator_sk_path.is_file():
+    try:
+        validator_sk_bytes, validator_pk_bytes = load_validator_keys(
+            str(validator_sk_path), str(validator_pk_path)
+        )
+        print("INFO: Loaded Validator keys from validator_sk.txt / validator_pk.txt")
+    except Exception as e:
+        print("WARN: Could not load Validator keys, generating new: " + str(e))
+        validator_sk_bytes, validator_pk_bytes = generate_validator_keypair()
+        save_validator_keys(validator_sk_bytes, validator_pk_bytes)
+else:
+    print("INFO: Generating new Validator keypair (validator_sk.txt, validator_pk.txt)")
+    validator_sk_bytes, validator_pk_bytes = generate_validator_keypair()
+    save_validator_keys(validator_sk_bytes, validator_pk_bytes)
+
 # print("INFO pk: ", pk)
 keys_generation_time = time.time()
 print("INFO: Node Identifier:" + node_identifier)
@@ -208,6 +235,46 @@ def full_chain():
         'length': len(blockchain.chain),
     }
     return jsonify(response), 200
+
+@app.route('/validator/register', methods=['POST'])
+def validator_register():
+    """
+    Phase 1: Device registration. Body: { did_i [, attributes ] }.
+    Validator issues VC_i = SIGN_Validator({did_i, attributes}), computes vc_hash,
+    anchors {did_i, vc_hash, timestamp} on chain, returns { vc_i, vc_hash }.
+    """
+    values = request.get_json(silent=True)
+    if values is None:
+        values = request.values
+    did_i = values.get('did_i')
+    if not did_i:
+        return jsonify({'error': 'Missing did_i'}), 400
+    attributes = values.get('attributes', [])
+    if isinstance(attributes, str):
+        attributes = [attributes]
+
+    vc_payload = vc_create(did_i, attributes)
+    vc_signed = vc_sign(validator_sk_bytes, vc_payload)
+    vc_hash_val = vc_hash(vc_signed)
+    timestamp = vc_payload['timestamp']
+
+    blockchain.new_transaction_device_registration(did_i, vc_hash_val, timestamp)
+
+    return jsonify({
+        'message': 'VC issued and anchor queued',
+        'vc_i': vc_signed,
+        'vc_hash': vc_hash_val,
+        'did_i': did_i,
+    }), 201
+
+
+@app.route('/validator/public_key', methods=['GET'])
+def validator_public_key():
+    """Return Validator public key (base64) so devices can verify VCs."""
+    import base64
+    pk_b64 = base64.b64encode(validator_pk_bytes).decode('ascii')
+    return jsonify({'validator_pk': pk_b64}), 200
+
 
 @app.route('/nodes/register', methods=['POST'])
 def register_nodes():  # From Definitions
@@ -322,6 +389,13 @@ def _upload_file(window, filepath, filename, text_keygen, text_keygentime, text_
 def verify_block_action(current_transaction, text_keygen_time, text_sign_verif_time, text_block_creation_time):
     if len(current_transaction) <= 0:
         return False
+    transaction = current_transaction[0]
+
+    # Phase 1: device_registration anchor — no file validation; mine block with current_transactions
+    if transaction.get('type') == 'device_registration':
+        blockchain.new_block(blockchain.last_block['previous_hash'])
+        return True
+
     transaction = current_transaction.pop(0)
 
     if not blockchain.valid_file(transaction): # From definitions
@@ -349,6 +423,7 @@ def verify_block_action(current_transaction, text_keygen_time, text_sign_verif_t
     _ct = str(objectToBytes(ct, groupObj), 'utf-8')
 
     blockchain.current_transactions.insert(0,{
+        'type': 'message',
         'name': _filename,
         'file': _file,
         'file_hash': _hash,
